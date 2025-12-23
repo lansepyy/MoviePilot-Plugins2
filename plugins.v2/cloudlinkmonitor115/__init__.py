@@ -43,7 +43,7 @@ class Cloudlinkmonitor115(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "3.0.5"
+    plugin_version = "3.0.6"
     # 插件作者
     plugin_author = "thsrite"
     # 作者主页
@@ -185,7 +185,7 @@ class Cloudlinkmonitor115(_PluginBase):
                 self._overwrite_mode[mon_path] = _overwrite_mode
 
             # 启用115事件监控（可选）
-            if self._enabled and self._115_cookie and self._115_monitor_paths:
+            if self._enabled and self._115_cookie:
                 try:
                     # 初始化115客户端
                     self._115_client = P115Client(self._115_cookie, check_for_relogin=True)
