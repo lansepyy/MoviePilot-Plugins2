@@ -43,7 +43,7 @@ class Cloudlinkmonitor115(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "3.0.4"
+    plugin_version = "3.0.5"
     # 插件作者
     plugin_author = "thsrite"
     # 作者主页
@@ -128,7 +128,6 @@ class Cloudlinkmonitor115(_PluginBase):
             self._strm = config.get("strm")
             # 115配置
             self._115_cookie = config.get("cookie_115") or ""
-            self._115_monitor_paths = config.get("monitor_paths_115") or ""
             self._event_poll_interval = config.get("event_poll_interval") or 10
 
         # 停止现有任务
@@ -245,7 +244,6 @@ class Cloudlinkmonitor115(_PluginBase):
             "size": self._size,
             "refresh": self._refresh,
             "cookie_115": self._115_cookie,
-            "monitor_paths_115": self._115_monitor_paths,
             "event_poll_interval": self._event_poll_interval,
         })
 
@@ -293,9 +291,9 @@ class Cloudlinkmonitor115(_PluginBase):
 
     def check_115_events(self):
         """
-        检查115事件，匹配到监控路径时触发全量同步
+        检查115事件，检测到文件变动事件时触发全量同步
         """
-        if not self._115_client or not self._115_monitor_paths:
+        if not self._115_client:
             return
         
         try:
@@ -305,17 +303,9 @@ class Cloudlinkmonitor115(_PluginBase):
                 self.__update_config()
                 logger.info("首次启动，从最新事件开始监控")
             
-            # 解析115监控路径列表
-            monitor_paths_115 = [p.strip() for p in self._115_monitor_paths.split("\n") if p.strip()]
-            if not monitor_paths_115:
-                logger.warning("未配置115监控路径")
-                return
-            
-            logger.debug(f"115监控路径：{monitor_paths_115}")
-            
             # 轮询115事件
             trigger_sync = False
-            new_events = []
+            event_count = 0
             
             for event in iter_life_behavior_once(
                 self._115_client,
@@ -338,68 +328,34 @@ class Cloudlinkmonitor115(_PluginBase):
                     self._last_event_id = event_id
                     continue
                 
-                # 输出完整事件信息用于调试
-                logger.info(f"115事件详情: {event}")
+                # 检测到目标事件类型，记录并准备触发
+                event_count += 1
+                trigger_sync = True
                 
-                # 获取事件路径
-                full_path = event.get("file_path") or event.get("path") or ""
-                if not full_path:
-                    file_name = event.get("file_name", "")
-                    parent_path = event.get("parent_path", "")
-                    if parent_path and file_name:
-                        full_path = f"{parent_path}/{file_name}".replace("//", "/")
+                event_type_name = {
+                    1: "上传", 2: "上传", 
+                    5: "移动", 6: "移动",
+                    14: "云下载"
+                }.get(event_type, "未知")
                 
-                # 输出路径信息用于调试
-                logger.info(f"115事件路径: [{full_path}]")
+                logger.info(f"检测到115事件 - ID:{event_id}, 类型:{event_type_name}({event_type})")
                 
-                # 检查是否匹配监控路径
-                matched = False
-                matched_path = ""
-                for monitor_path in monitor_paths_115:
-                    logger.debug(f"检查匹配: [{full_path}] vs [{monitor_path}]")
-                    if full_path and full_path.startswith(monitor_path):
-                        matched = True
-                        matched_path = monitor_path
-                        logger.info(f"✓ 路径匹配成功: [{monitor_path}]")
-                        break
-                
-                if not matched and full_path:
-                    logger.info(f"✗ 路径不匹配任何监控路径: [{full_path}]")
-                
-                if matched:
-                    # 记录匹配的事件
-                    new_events.append({
-                        "event": event,
-                        "path": full_path,
-                        "matched_path": matched_path
-                    })
-                
-                # 更新事件ID
+                # 更新最新事件ID
                 self._last_event_id = event_id
             
-            # 保存最新事件ID
-            if self._last_event_id:
+            # 如果检测到事件且当前没有正在执行同步，触发全量同步
+            if trigger_sync and event_count > 0:
+                logger.info(f"检测到 {event_count} 个115文件变动事件，触发全量同步")
+                if not self._syncing:
+                    self.sync_all()
+                else:
+                    logger.info("同步任务正在执行中，跳过本次触发")
+                
+                # 持久化最新的事件ID
                 self.__update_config()
-            
-            # 处理所有匹配的新事件
-            if new_events:
-                logger.info(f"检测到 {len(new_events)} 个115新事件，触发全量同步")
-                for item in new_events:
-                    event = item["event"]
-                    event_id = event.get("id", 0)
-                    event_type = event.get("type", 0)
-                    event_type_name = event.get("type_name", "unknown")
-                    logger.info(f"  - ID={event_id} Type={event_type}({event_type_name}) 路径={item['path']} 匹配=[{item['matched_path']}]")
-                trigger_sync = True
-            
-            # 处理完所有事件后，如果有触发标记则执行一次同步
-            if trigger_sync:
-                self.sync_all()
-            else:
-                logger.debug("本次轮询未检测到匹配监控路径的事件")
                 
         except Exception as e:
-            logger.error(f"115事件监控发生错误：{str(e)}")
+            logger.error(f"检查115事件时出错: {str(e)}")
             logger.error(traceback.format_exc())
 
     def __handle_file(self, event_path: str, mon_path: str):
@@ -1091,28 +1047,6 @@ class Cloudlinkmonitor115(_PluginBase):
                                     {
                                         'component': 'VTextarea',
                                         'props': {
-                                            'model': 'monitor_paths_115',
-                                            'label': '115监控路径',
-                                            'rows': 3,
-                                            'placeholder': '每一行一个115网盘路径，如：\n/云下载/电影\n/云下载/电视剧'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextarea',
-                                        'props': {
                                             'model': 'monitor_dirs',
                                             'label': '监控目录',
                                             'rows': 5,
@@ -1229,7 +1163,6 @@ class Cloudlinkmonitor115(_PluginBase):
             "cron": "",
             "size": 0,
             "cookie_115": "",
-            "monitor_paths_115": "",
             "event_poll_interval": 10
         }
 
