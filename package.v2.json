@@ -475,6 +475,18 @@
       "v1.0": "监控云盘目录文件变化，按原文件名软连接"
     }
   },
+  "Cloudlinkmonitor115": {
+    "name": "目录实时监控115",
+    "description": "基于115云盘事件监控目录文件变化，自动转移媒体文件。",
+    "labels": "云盘,工具",
+    "version": "2.5.9",
+    "icon": "Linkease_A.png",
+    "author": "thsrite",
+    "level": 1,
+    "history": {
+      "v2.5.9": "使用115原生事件API替代watchdog监控"
+    }
+  },
   "CloudStrmCompanion": {
     "name": "云盘Strm助手",
     "description": "实时监控、定时全量增量生成strm文件。",
