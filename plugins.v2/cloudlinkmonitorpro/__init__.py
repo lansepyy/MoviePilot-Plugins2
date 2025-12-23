@@ -9,9 +9,8 @@ from typing import List, Tuple, Dict, Any, Optional
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from watchdog.events import FileSystemEventHandler
-from watchdog.observers import Observer
-from watchdog.observers.polling import PollingObserver
+from p115client import P115Client
+from p115client.tool.life import iter_life_behavior_once
 
 from app import schemas
 from app.chain.media import MediaChain
@@ -36,28 +35,9 @@ from app.utils.system import SystemUtils
 lock = threading.Lock()
 
 
-class FileMonitorHandler(FileSystemEventHandler):
-    """
-    目录监控响应类
-    """
-
-    def __init__(self, monpath: str, sync: Any, **kwargs):
-        super(FileMonitorHandler, self).__init__(**kwargs)
-        self._watch_path = monpath
-        self.sync = sync
-
-    def on_created(self, event):
-        self.sync.event_handler(event=event, text="创建",
-                                mon_path=self._watch_path, event_path=event.src_path)
-
-    def on_moved(self, event):
-        self.sync.event_handler(event=event, text="移动",
-                                mon_path=self._watch_path, event_path=event.dest_path)
-
-
 class CloudLinkMonitor(_PluginBase):
     # 插件名称
-    plugin_name = "目录实时监控"
+    plugin_name = "目录实时监控pro"
     # 插件描述
     plugin_desc = "监控目录文件变化，自动转移媒体文件。"
     # 插件图标
@@ -82,7 +62,6 @@ class CloudLinkMonitor(_PluginBase):
     transferchian = None
     tmdbchain = None
     storagechain = None
-    _observer = []
     _enabled = False
     _notify = False
     _onlyonce = False
@@ -96,13 +75,17 @@ class CloudLinkMonitor(_PluginBase):
     filetransfer = None
     mediaChain = None
     _size = 0
-    # 模式 compatibility/fast
-    _mode = "compatibility"
     # 转移方式
     _transfer_type = "softlink"
     _monitor_dirs = ""
     _exclude_keywords = ""
     _interval: int = 10
+    # 115相关配置
+    _115_cookie = ""
+    _115_monitor_paths = ""
+    _event_poll_interval: int = 10
+    _115_client = None
+    _last_event_id = 0
     # 存储源目录与目的目录关系
     _dirconf: Dict[str, Optional[Path]] = {}
     # 存储源目录转移方式
@@ -134,7 +117,6 @@ class CloudLinkMonitor(_PluginBase):
             self._scrape = config.get("scrape")
             self._category = config.get("category")
             self._refresh = config.get("refresh")
-            self._mode = config.get("mode")
             self._transfer_type = config.get("transfer_type")
             self._monitor_dirs = config.get("monitor_dirs") or ""
             self._exclude_keywords = config.get("exclude_keywords") or ""
@@ -143,6 +125,10 @@ class CloudLinkMonitor(_PluginBase):
             self._size = config.get("size") or 0
             self._softlink = config.get("softlink")
             self._strm = config.get("strm")
+            # 115配置
+            self._115_cookie = config.get("cookie_115") or ""
+            self._115_monitor_paths = config.get("monitor_paths_115") or ""
+            self._event_poll_interval = config.get("event_poll_interval") or 10
 
         # 停止现有任务
         self.stop_service()
@@ -198,43 +184,26 @@ class CloudLinkMonitor(_PluginBase):
                 self._transferconf[mon_path] = _transfer_type
                 self._overwrite_mode[mon_path] = _overwrite_mode
 
-                # 启用目录监控
-                if self._enabled:
-                    # 检查媒体库目录是不是下载目录的子目录
-                    try:
-                        if target_path and target_path.is_relative_to(Path(mon_path)):
-                            logger.warn(f"{target_path} 是监控目录 {mon_path} 的子目录，无法监控")
-                            self.systemmessage.put(f"{target_path} 是下载目录 {mon_path} 的子目录，无法监控")
-                            continue
-                    except Exception as e:
-                        logger.debug(str(e))
-                        pass
-
-                    try:
-                        if self._mode == "compatibility":
-                            # 兼容模式，目录同步性能降低且NAS不能休眠，但可以兼容挂载的远程共享目录如SMB
-                            observer = PollingObserver(timeout=10)
-                        else:
-                            # 内部处理系统操作类型选择最优解
-                            observer = Observer(timeout=10)
-                        self._observer.append(observer)
-                        observer.schedule(FileMonitorHandler(mon_path, self), path=mon_path, recursive=True)
-                        observer.daemon = True
-                        observer.start()
-                        logger.info(f"{mon_path} 的云盘实时监控服务启动")
-                    except Exception as e:
-                        err_msg = str(e)
-                        if "inotify" in err_msg and "reached" in err_msg:
-                            logger.warn(
-                                f"云盘实时监控服务启动出现异常：{err_msg}，请在宿主机上（不是docker容器内）执行以下命令并重启："
-                                + """
-                                     echo fs.inotify.max_user_watches=524288 | sudo tee -a /etc/sysctl.conf
-                                     echo fs.inotify.max_user_instances=524288 | sudo tee -a /etc/sysctl.conf
-                                     sudo sysctl -p
-                                     """)
-                        else:
-                            logger.error(f"{mon_path} 启动目云盘实时监控失败：{err_msg}")
-                        self.systemmessage.put(f"{mon_path} 启动云盘实时监控失败：{err_msg}")
+            # 启用115事件监控（可选）
+            if self._enabled and self._115_cookie and self._115_monitor_paths:
+                try:
+                    # 初始化115客户端
+                    self._115_client = P115Client(self._115_cookie, check_for_relogin=True)
+                    logger.info("115客户端初始化成功")
+                    
+                    # 添加115事件监控定时任务
+                    self._scheduler.add_job(
+                        func=self.check_115_events,
+                        trigger='interval',
+                        seconds=self._event_poll_interval,
+                        name="115事件监控"
+                    )
+                    logger.info(f"115事件监控服务启动，轮询间隔：{self._event_poll_interval}秒")
+                except Exception as e:
+                    logger.error(f"115事件监控启动失败：{str(e)}")
+                    self.systemmessage.put(f"115事件监控启动失败：{str(e)}")
+            elif self._enabled:
+                logger.info("未配置115监控，将仅使用定时任务模式")
 
             # 运行一次定时服务
             if self._onlyonce:
@@ -262,7 +231,6 @@ class CloudLinkMonitor(_PluginBase):
             "enabled": self._enabled,
             "notify": self._notify,
             "onlyonce": self._onlyonce,
-            "mode": self._mode,
             "transfer_type": self._transfer_type,
             "monitor_dirs": self._monitor_dirs,
             "exclude_keywords": self._exclude_keywords,
@@ -275,6 +243,9 @@ class CloudLinkMonitor(_PluginBase):
             "category": self._category,
             "size": self._size,
             "refresh": self._refresh,
+            "cookie_115": self._115_cookie,
+            "monitor_paths_115": self._115_monitor_paths,
+            "event_poll_interval": self._event_poll_interval,
         })
 
     @eventmanager.register(EventType.PluginAction)
@@ -310,18 +281,60 @@ class CloudLinkMonitor(_PluginBase):
                 self.__handle_file(event_path=str(file_path), mon_path=mon_path)
         logger.info("全量同步云盘实时监控目录完成！")
 
-    def event_handler(self, event, mon_path: str, text: str, event_path: str):
+    def check_115_events(self):
         """
-        处理文件变化
-        :param event: 事件
-        :param mon_path: 监控目录
-        :param text: 事件描述
-        :param event_path: 事件文件路径
+        检查115事件，匹配到监控路径时触发全量同步
         """
-        if not event.is_directory:
-            # 文件发生变化
-            logger.debug("文件%s：%s" % (text, event_path))
-            self.__handle_file(event_path=event_path, mon_path=mon_path)
+        if not self._115_client or not self._115_monitor_paths:
+            return
+        
+        try:
+            # 解析115监控路径列表
+            monitor_paths_115 = [p.strip() for p in self._115_monitor_paths.split("\n") if p.strip()]
+            
+            # 轮询115事件
+            for event in iter_life_behavior_once(
+                self._115_client,
+                from_id=self._last_event_id,
+                from_time=0 if self._last_event_id else -1,
+                cooldown=0.5
+            ):
+                event_id = int(event.get("id", 0))
+                if event_id > self._last_event_id:
+                    self._last_event_id = event_id
+                
+                # 获取事件信息
+                file_path = event.get("file_path", "")
+                file_name = event.get("file_name", "")
+                parent_path = event.get("parent_path", "")
+                event_type = event.get("type", 0)
+                
+                # 构建完整路径
+                if parent_path and file_name:
+                    full_path = f"{parent_path}/{file_name}".replace("//", "/")
+                elif file_path:
+                    full_path = file_path
+                else:
+                    continue
+                
+                # 排除浏览类事件（不改变文件内容的操作）
+                # 3:star_image, 4:star_file, 7:browse_image, 8:browse_video, 9:browse_audio, 10:browse_document, 19:folder_label
+                if event_type in [3, 4, 7, 8, 9, 10, 19]:
+                    continue
+                
+                # 检查是否匹配监控路径
+                matched = False
+                for monitor_path in monitor_paths_115:
+                    if full_path.startswith(monitor_path):
+                        matched = True
+                        logger.info(f"检测到115文件事件：{full_path}，触发全量同步")
+                        # 触发全量同步所有监控目录
+                        self.sync_all()
+                        break
+                
+        except Exception as e:
+            logger.error(f"115事件监控发生错误：{str(e)}")
+            logger.error(traceback.format_exc())
 
     def __handle_file(self, event_path: str, mon_path: str):
         """
@@ -906,26 +919,6 @@ class CloudLinkMonitor(_PluginBase):
                                     {
                                         'component': 'VSelect',
                                         'props': {
-                                            'model': 'mode',
-                                            'label': '监控模式',
-                                            'items': [
-                                                {'title': '兼容模式', 'value': 'compatibility'},
-                                                {'title': '性能模式', 'value': 'fast'}
-                                            ]
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSelect',
-                                        'props': {
                                             'model': 'transfer_type',
                                             'label': '转移方式',
                                             'items': [
@@ -966,7 +959,7 @@ class CloudLinkMonitor(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 6
                                 },
                                 'content': [
                                     {
@@ -975,6 +968,67 @@ class CloudLinkMonitor(_PluginBase):
                                             'model': 'cron',
                                             'label': '定时任务',
                                             'placeholder': '0 0 * * *'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'event_poll_interval',
+                                            'label': '事件轮询间隔（秒）',
+                                            'placeholder': '10'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextarea',
+                                        'props': {
+                                            'model': 'cookie_115',
+                                            'label': '115 Cookie',
+                                            'rows': 2,
+                                            'placeholder': '填入115网盘的Cookie'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextarea',
+                                        'props': {
+                                            'model': 'monitor_paths_115',
+                                            'label': '115监控路径',
+                                            'rows': 3,
+                                            'placeholder': '每一行一个115网盘路径，如：\n/云下载/电影\n/云下载/电视剧'
                                         }
                                     }
                                 ]
@@ -1102,13 +1156,15 @@ class CloudLinkMonitor(_PluginBase):
             "refresh": True,
             "softlink": False,
             "strm": False,
-            "mode": "fast",
-            "transfer_type": "filesoftlink",
+            "transfer_type": "softlink",
             "monitor_dirs": "",
             "exclude_keywords": "",
             "interval": 10,
             "cron": "",
-            "size": 0
+            "size": 0,
+            "cookie_115": "",
+            "monitor_paths_115": "",
+            "event_poll_interval": 10
         }
 
     def get_page(self) -> List[dict]:
@@ -1118,14 +1174,8 @@ class CloudLinkMonitor(_PluginBase):
         """
         退出插件
         """
-        if self._observer:
-            for observer in self._observer:
-                try:
-                    observer.stop()
-                    observer.join()
-                except Exception as e:
-                    print(str(e))
-        self._observer = []
+        if self._115_client:
+            self._115_client = None
         if self._scheduler:
             self._scheduler.remove_all_jobs()
             if self._scheduler.running:
