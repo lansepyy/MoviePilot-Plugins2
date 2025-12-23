@@ -338,6 +338,9 @@ class Cloudlinkmonitor115(_PluginBase):
                     self._last_event_id = event_id
                     continue
                 
+                # 输出完整事件信息用于调试
+                logger.info(f"115事件详情: {event}")
+                
                 # 获取事件路径
                 full_path = event.get("file_path") or event.get("path") or ""
                 if not full_path:
