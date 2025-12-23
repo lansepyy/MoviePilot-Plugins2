@@ -346,14 +346,22 @@ class Cloudlinkmonitor115(_PluginBase):
                     if parent_path and file_name:
                         full_path = f"{parent_path}/{file_name}".replace("//", "/")
                 
+                # 输出路径信息用于调试
+                logger.info(f"115事件路径: [{full_path}]")
+                
                 # 检查是否匹配监控路径
                 matched = False
                 matched_path = ""
                 for monitor_path in monitor_paths_115:
+                    logger.debug(f"检查匹配: [{full_path}] vs [{monitor_path}]")
                     if full_path and full_path.startswith(monitor_path):
                         matched = True
                         matched_path = monitor_path
+                        logger.info(f"✓ 路径匹配成功: [{monitor_path}]")
                         break
+                
+                if not matched and full_path:
+                    logger.info(f"✗ 路径不匹配任何监控路径: [{full_path}]")
                 
                 if matched:
                     # 记录匹配的事件
