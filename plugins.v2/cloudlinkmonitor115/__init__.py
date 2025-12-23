@@ -43,7 +43,7 @@ class Cloudlinkmonitor115(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "3.0.1"
+    plugin_version = "3.0.2"
     # 插件作者
     plugin_author = "thsrite"
     # 作者主页
@@ -86,6 +86,7 @@ class Cloudlinkmonitor115(_PluginBase):
     _event_poll_interval: int = 10
     _115_client = None
     _last_event_id = 0
+    _syncing = False  # 全量同步运行标志
     # 存储源目录与目的目录关系
     _dirconf: Dict[str, Optional[Path]] = {}
     # 存储源目录转移方式
@@ -269,17 +270,26 @@ class Cloudlinkmonitor115(_PluginBase):
         """
         立即运行一次，全量同步目录中所有文件
         """
-        logger.info("开始全量同步云盘实时监控目录 ...")
-        # 遍历所有监控目录
-        for mon_path in self._dirconf.keys():
-            logger.info(f"开始处理监控目录 {mon_path} ...")
-            list_files = SystemUtils.list_files(Path(mon_path), settings.RMT_MEDIAEXT)
-            logger.info(f"监控目录 {mon_path} 共发现 {len(list_files)} 个文件")
-            # 遍历目录下所有文件
-            for file_path in list_files:
-                logger.info(f"开始处理文件 {file_path} ...")
-                self.__handle_file(event_path=str(file_path), mon_path=mon_path)
-        logger.info("全量同步云盘实时监控目录完成！")
+        # 检查是否已经在运行
+        if self._syncing:
+            logger.warning("全量同步任务已在运行中，跳过本次触发")
+            return
+        
+        try:
+            self._syncing = True
+            logger.info("开始全量同步云盘实时监控目录 ...")
+            # 遍历所有监控目录
+            for mon_path in self._dirconf.keys():
+                logger.info(f"开始处理监控目录 {mon_path} ...")
+                list_files = SystemUtils.list_files(Path(mon_path), settings.RMT_MEDIAEXT)
+                logger.info(f"监控目录 {mon_path} 共发现 {len(list_files)} 个文件")
+                # 遍历目录下所有文件
+                for file_path in list_files:
+                    logger.info(f"开始处理文件 {file_path} ...")
+                    self.__handle_file(event_path=str(file_path), mon_path=mon_path)
+            logger.info("全量同步云盘实时监控目录完成！")
+        finally:
+            self._syncing = False
 
     def check_115_events(self):
         """
@@ -289,60 +299,66 @@ class Cloudlinkmonitor115(_PluginBase):
             return
         
         try:
+            # 首次运行时设置为0，从最新事件开始
+            if self._last_event_id is None:
+                self._last_event_id = 0
+                self.__update_config()
+                logger.info("首次启动，从最新事件开始监控")
+            
             # 轮询115事件
-            event_count = 0
             trigger_sync = False
-            current_time = int(datetime.datetime.now().timestamp())
+            new_events = []
             
             for event in iter_life_behavior_once(
                 self._115_client,
                 from_id=self._last_event_id,
-                from_time=-1,  # -1表示最近时间
+                from_time=-1,
                 cooldown=0.5
             ):
-                event_count += 1
                 event_id = int(event.get("id", 0))
-                event_time = event.get("time", 0)
                 
-                # 记录事件时间用于调试
-                logger.debug(f"事件 ID={event_id} 原始时间={event_time} 当前时间={current_time}")
-                
-                if event_id > self._last_event_id:
-                    self._last_event_id = event_id
-                    # 实时保存最新事件ID
-                    self.__update_config()
+                # API应该只返回新事件，但双重确保跳过旧事件
+                if event_id <= self._last_event_id:
+                    continue
                 
                 # 获取事件信息
                 event_type = event.get("type", 0)
-                event_type_name = event.get("type_name", "unknown")
-                
-                # 尝试多种方式获取路径
-                full_path = event.get("file_path") or event.get("path") or ""
-                if not full_path:
-                    file_name = event.get("file_name", "")
-                    parent_path = event.get("parent_path", "")
-                    if parent_path and file_name:
-                        full_path = f"{parent_path}/{file_name}".replace("//", "/")
-                
-                if not full_path:
-                    full_path = "unknown"
                 
                 # 只监控：上传(1,2)、移动(5,6)、云下载/离线下载(14)
-                # 1: upload_file, 2: upload_folder, 5: move_file, 6: move_folder, 14: receive
                 if event_type not in [1, 2, 5, 6, 14]:
-                    logger.debug(f"忽略其他事件 ID={event_id} Type={event_type}({event_type_name}) 路径={full_path}")
+                    # 更新ID但不触发
+                    self._last_event_id = event_id
                     continue
                 
-                # 检测到目标事件，触发同步
-                logger.info(f"检测到115事件 ID={event_id} Type={event_type}({event_type_name}) 时间={event_time} 路径={full_path}")
+                # 记录有效的新事件
+                new_events.append(event)
+                self._last_event_id = event_id
+            
+            # 保存最新事件ID
+            if self._last_event_id:
+                self.__update_config()
+            
+            # 处理所有新事件
+            if new_events:
+                logger.info(f"检测到 {len(new_events)} 个115新事件，触发全量同步")
+                for event in new_events:
+                    event_id = event.get("id", 0)
+                    event_type = event.get("type", 0)
+                    event_type_name = event.get("type_name", "unknown")
+                    full_path = event.get("file_path") or event.get("path") or ""
+                    if not full_path:
+                        file_name = event.get("file_name", "")
+                        parent_path = event.get("parent_path", "")
+                        if parent_path and file_name:
+                            full_path = f"{parent_path}/{file_name}".replace("//", "/")
+                    logger.info(f"  - ID={event_id} Type={event_type}({event_type_name}) 路径={full_path}")
                 trigger_sync = True
             
             # 处理完所有事件后，如果有触发标记则执行一次同步
             if trigger_sync:
-                logger.info(f"本次轮询检测到上传/移动/云下载事件，触发全量同步")
                 self.sync_all()
-            elif event_count > 0:
-                logger.debug(f"本次轮询获取到 {event_count} 个115事件，但都不是目标事件，不触发同步")
+            else:
+                logger.debug("本次轮询未检测到新的上传/移动/云下载事件")
                 
         except Exception as e:
             logger.error(f"115事件监控发生错误：{str(e)}")
