@@ -85,7 +85,7 @@ class Cloudlinkmonitor115(_PluginBase):
     _115_monitor_paths = ""
     _event_poll_interval: int = 10
     _115_client = None
-    _last_event_id = 0
+    _last_event_id = None
     # 存储源目录与目的目录关系
     _dirconf: Dict[str, Optional[Path]] = {}
     # 存储源目录转移方式
@@ -129,6 +129,8 @@ class Cloudlinkmonitor115(_PluginBase):
             self._115_cookie = config.get("cookie_115") or ""
             self._115_monitor_paths = config.get("monitor_paths_115") or ""
             self._event_poll_interval = config.get("event_poll_interval") or 10
+            # 恢复上次事件ID
+            self._last_event_id = config.get("last_event_id_115")
 
         # 停止现有任务
         self.stop_service()
@@ -199,6 +201,15 @@ class Cloudlinkmonitor115(_PluginBase):
                         name="115事件监控"
                     )
                     logger.info(f"115事件监控服务启动，轮询间隔：{self._event_poll_interval}秒")
+                    
+                    # 首次启动时立即扫描一次（延迟3秒执行）
+                    self._scheduler.add_job(
+                        name="115监控首次全量扫描",
+                        func=self.sync_all,
+                        trigger='date',
+                        run_date=datetime.datetime.now(tz=pytz.timezone(settings.TZ)) + datetime.timedelta(seconds=3)
+                    )
+                    logger.info("115监控首次启动，3秒后执行全量扫描")
                 except Exception as e:
                     logger.error(f"115事件监控启动失败：{str(e)}")
                     self.systemmessage.put(f"115事件监控启动失败：{str(e)}")
@@ -246,6 +257,7 @@ class Cloudlinkmonitor115(_PluginBase):
             "cookie_115": self._115_cookie,
             "monitor_paths_115": self._115_monitor_paths,
             "event_poll_interval": self._event_poll_interval,
+            "last_event_id_115": self._last_event_id,
         })
 
     @eventmanager.register(EventType.PluginAction)
@@ -292,22 +304,36 @@ class Cloudlinkmonitor115(_PluginBase):
             # 解析115监控路径列表
             monitor_paths_115 = [p.strip() for p in self._115_monitor_paths.split("\n") if p.strip()]
             
+            # 首次运行时设置为0
+            if self._last_event_id is None:
+                logger.info("首次运行115事件监控，从最近事件开始...")
+                self._last_event_id = 0
+                self.__update_config()
+            
+            logger.debug(f"115监控路径：{monitor_paths_115}，上次事件ID：{self._last_event_id}")
+            
             # 轮询115事件
+            # from_time=-1 表示获取最近的事件，from_id=0表示从最新的开始
+            event_count = 0
             for event in iter_life_behavior_once(
                 self._115_client,
                 from_id=self._last_event_id,
-                from_time=0 if self._last_event_id else -1,
+                from_time=-1,  # -1表示最近时间
                 cooldown=0.5
             ):
+                event_count += 1
                 event_id = int(event.get("id", 0))
                 if event_id > self._last_event_id:
                     self._last_event_id = event_id
+                    # 实时保存最新事件ID
+                    self.__update_config()
                 
                 # 获取事件信息
                 file_path = event.get("file_path", "")
                 file_name = event.get("file_name", "")
                 parent_path = event.get("parent_path", "")
                 event_type = event.get("type", 0)
+                event_type_name = event.get("type_name", "unknown")
                 
                 # 构建完整路径
                 if parent_path and file_name:
@@ -315,22 +341,34 @@ class Cloudlinkmonitor115(_PluginBase):
                 elif file_path:
                     full_path = file_path
                 else:
+                    logger.debug(f"事件 ID={event_id} 无法获取路径，跳过")
                     continue
                 
                 # 排除浏览类事件（不改变文件内容的操作）
                 # 3:star_image, 4:star_file, 7:browse_image, 8:browse_video, 9:browse_audio, 10:browse_document, 19:folder_label
                 if event_type in [3, 4, 7, 8, 9, 10, 19]:
+                    logger.debug(f"忽略浏览类事件(type={event_type})：{full_path}")
                     continue
+                
+                logger.info(f"115事件 ID={event_id} Type={event_type}({event_type_name}) 路径={full_path}")
                 
                 # 检查是否匹配监控路径
                 matched = False
                 for monitor_path in monitor_paths_115:
                     if full_path.startswith(monitor_path):
                         matched = True
-                        logger.info(f"检测到115文件事件：{full_path}，触发全量同步")
+                        logger.info(f"✓ 匹配监控路径 [{monitor_path}]，触发全量同步")
                         # 触发全量同步所有监控目录
                         self.sync_all()
                         break
+                
+                if not matched:
+                    logger.info(f"✗ 路径不匹配任何监控路径，跳过：{full_path}")
+            
+            if event_count > 0:
+                logger.info(f"本次轮询获取到 {event_count} 个115事件")
+            else:
+                logger.debug("本次轮询未获取到新事件")
                 
         except Exception as e:
             logger.error(f"115事件监控发生错误：{str(e)}")
