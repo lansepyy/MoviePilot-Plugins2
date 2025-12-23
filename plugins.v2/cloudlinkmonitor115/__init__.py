@@ -289,18 +289,30 @@ class Cloudlinkmonitor115(_PluginBase):
             return
         
         try:
-            # 轮询115事件
+            # 轮询115事件，只获取最近10分钟内的事件
             event_count = 0
             trigger_sync = False
+            current_time = int(datetime.datetime.now().timestamp())
+            time_threshold = current_time - 600  # 10分钟前
             
             for event in iter_life_behavior_once(
                 self._115_client,
                 from_id=self._last_event_id,
-                from_time=0 if self._last_event_id else -1,
+                from_time=-1,  # -1表示最近时间
                 cooldown=0.5
             ):
                 event_count += 1
                 event_id = int(event.get("id", 0))
+                event_time = int(event.get("time", 0))
+                
+                # 跳过10分钟前的旧事件
+                if event_time < time_threshold:
+                    logger.debug(f"跳过旧事件 ID={event_id} 时间={event_time}")
+                    if event_id > self._last_event_id:
+                        self._last_event_id = event_id
+                        self.__update_config()
+                    continue
+                
                 if event_id > self._last_event_id:
                     self._last_event_id = event_id
                     # 实时保存最新事件ID
@@ -309,16 +321,16 @@ class Cloudlinkmonitor115(_PluginBase):
                 # 获取事件信息
                 event_type = event.get("type", 0)
                 event_type_name = event.get("type_name", "unknown")
-                file_path = event.get("file_path", "")
-                file_name = event.get("file_name", "")
-                parent_path = event.get("parent_path", "")
                 
-                # 构建完整路径用于日志
-                if parent_path and file_name:
-                    full_path = f"{parent_path}/{file_name}".replace("//", "/")
-                elif file_path:
-                    full_path = file_path
-                else:
+                # 尝试多种方式获取路径
+                full_path = event.get("file_path") or event.get("path") or ""
+                if not full_path:
+                    file_name = event.get("file_name", "")
+                    parent_path = event.get("parent_path", "")
+                    if parent_path and file_name:
+                        full_path = f"{parent_path}/{file_name}".replace("//", "/")
+                
+                if not full_path:
                     full_path = "unknown"
                 
                 # 只监控：上传(1,2)、移动(5,6)、云下载/离线下载(14)
@@ -328,7 +340,7 @@ class Cloudlinkmonitor115(_PluginBase):
                     continue
                 
                 # 检测到目标事件，触发同步
-                logger.info(f"检测到115事件 ID={event_id} Type={event_type}({event_type_name}) 路径={full_path}")
+                logger.info(f"检测到115事件 ID={event_id} Type={event_type}({event_type_name}) 时间={event_time} 路径={full_path}")
                 trigger_sync = True
             
             # 处理完所有事件后，如果有触发标记则执行一次同步
