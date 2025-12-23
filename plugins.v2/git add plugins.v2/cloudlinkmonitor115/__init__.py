@@ -35,9 +35,9 @@ from app.utils.system import SystemUtils
 lock = threading.Lock()
 
 
-class CloudlinkmonitorPro(_PluginBase):
+class Cloudlinkmonitor115(_PluginBase):
     # 插件名称
-    plugin_name = "目录实时监控pro"
+    plugin_name = "目录实时监控115"
     # 插件描述
     plugin_desc = "监控目录文件变化，自动转移媒体文件。"
     # 插件图标
@@ -49,7 +49,7 @@ class CloudlinkmonitorPro(_PluginBase):
     # 作者主页
     author_url = "https://github.com/thsrite"
     # 插件配置项ID前缀
-    plugin_config_prefix = "cloudlinkmonitorpro_"
+    plugin_config_prefix = "cloudlinkmonitor115_"
     # 加载顺序
     plugin_order = 4
     # 可使用的用户级别
@@ -717,8 +717,8 @@ class CloudlinkmonitorPro(_PluginBase):
         """
         if self._enabled and self._cron:
             return [{
-                "id": "CloudlinkmonitorPro",
-                "name": "云盘实时监控全量同步服务",
+                "id": "Cloudlinkmonitor115",
+                "name": "云盘实时监控115全量同步服务",
                 "trigger": CronTrigger.from_crontab(self._cron),
                 "func": self.sync_all,
                 "kwargs": {}
