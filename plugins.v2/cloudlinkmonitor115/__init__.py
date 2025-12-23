@@ -289,11 +289,10 @@ class Cloudlinkmonitor115(_PluginBase):
             return
         
         try:
-            # 轮询115事件，只获取最近10分钟内的事件
+            # 轮询115事件
             event_count = 0
             trigger_sync = False
             current_time = int(datetime.datetime.now().timestamp())
-            time_threshold = current_time - 600  # 10分钟前
             
             for event in iter_life_behavior_once(
                 self._115_client,
@@ -303,15 +302,10 @@ class Cloudlinkmonitor115(_PluginBase):
             ):
                 event_count += 1
                 event_id = int(event.get("id", 0))
-                event_time = int(event.get("time", 0))
+                event_time = event.get("time", 0)
                 
-                # 跳过10分钟前的旧事件
-                if event_time < time_threshold:
-                    logger.debug(f"跳过旧事件 ID={event_id} 时间={event_time}")
-                    if event_id > self._last_event_id:
-                        self._last_event_id = event_id
-                        self.__update_config()
-                    continue
+                # 记录事件时间用于调试
+                logger.debug(f"事件 ID={event_id} 原始时间={event_time} 当前时间={current_time}")
                 
                 if event_id > self._last_event_id:
                     self._last_event_id = event_id
