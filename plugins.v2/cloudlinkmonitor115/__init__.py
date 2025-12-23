@@ -43,7 +43,7 @@ class Cloudlinkmonitor115(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "3.0.3"
+    plugin_version = "3.0.4"
     # 插件作者
     plugin_author = "thsrite"
     # 作者主页
@@ -305,6 +305,14 @@ class Cloudlinkmonitor115(_PluginBase):
                 self.__update_config()
                 logger.info("首次启动，从最新事件开始监控")
             
+            # 解析115监控路径列表
+            monitor_paths_115 = [p.strip() for p in self._115_monitor_paths.split("\n") if p.strip()]
+            if not monitor_paths_115:
+                logger.warning("未配置115监控路径")
+                return
+            
+            logger.debug(f"115监控路径：{monitor_paths_115}")
+            
             # 轮询115事件
             trigger_sync = False
             new_events = []
@@ -330,35 +338,54 @@ class Cloudlinkmonitor115(_PluginBase):
                     self._last_event_id = event_id
                     continue
                 
-                # 记录有效的新事件
-                new_events.append(event)
+                # 获取事件路径
+                full_path = event.get("file_path") or event.get("path") or ""
+                if not full_path:
+                    file_name = event.get("file_name", "")
+                    parent_path = event.get("parent_path", "")
+                    if parent_path and file_name:
+                        full_path = f"{parent_path}/{file_name}".replace("//", "/")
+                
+                # 检查是否匹配监控路径
+                matched = False
+                matched_path = ""
+                for monitor_path in monitor_paths_115:
+                    if full_path and full_path.startswith(monitor_path):
+                        matched = True
+                        matched_path = monitor_path
+                        break
+                
+                if matched:
+                    # 记录匹配的事件
+                    new_events.append({
+                        "event": event,
+                        "path": full_path,
+                        "matched_path": matched_path
+                    })
+                
+                # 更新事件ID
                 self._last_event_id = event_id
             
             # 保存最新事件ID
             if self._last_event_id:
                 self.__update_config()
             
-            # 处理所有新事件
+            # 处理所有匹配的新事件
             if new_events:
                 logger.info(f"检测到 {len(new_events)} 个115新事件，触发全量同步")
-                for event in new_events:
+                for item in new_events:
+                    event = item["event"]
                     event_id = event.get("id", 0)
                     event_type = event.get("type", 0)
                     event_type_name = event.get("type_name", "unknown")
-                    full_path = event.get("file_path") or event.get("path") or ""
-                    if not full_path:
-                        file_name = event.get("file_name", "")
-                        parent_path = event.get("parent_path", "")
-                        if parent_path and file_name:
-                            full_path = f"{parent_path}/{file_name}".replace("//", "/")
-                    logger.info(f"  - ID={event_id} Type={event_type}({event_type_name}) 路径={full_path}")
+                    logger.info(f"  - ID={event_id} Type={event_type}({event_type_name}) 路径={item['path']} 匹配=[{item['matched_path']}]")
                 trigger_sync = True
             
             # 处理完所有事件后，如果有触发标记则执行一次同步
             if trigger_sync:
                 self.sync_all()
             else:
-                logger.debug("本次轮询未检测到新的上传/移动/云下载事件")
+                logger.debug("本次轮询未检测到匹配监控路径的事件")
                 
         except Exception as e:
             logger.error(f"115事件监控发生错误：{str(e)}")
